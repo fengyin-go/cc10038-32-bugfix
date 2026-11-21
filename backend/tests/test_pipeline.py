@@ -344,10 +344,33 @@ class TestReplayEngine:
         pipeline.parse_batch(batch_no)
         pipeline.validate_entities(batch_no)
 
+        # 重放必须先有可核验的命名规则：找不到就报错，不能只改“解析规则版本”标签。
+        from app.services import SERVICES
+        service = SERVICES["field_parser"]
+        rule, _ = service.create_entry({
+            "规则名称": "new-rule-v2",
+            "适用数据源": "replay-src",
+            "输入格式": "pipe",
+            "输出字段列表": "ts,sev,msg",
+            "解析引擎": "builtin",
+        })
+        service.run_action(rule["id"], "发布规则")
+
         result = pipeline.replay_batch(batch_no, "new-rule-v2")
         assert result["ok"] is True
         assert result["replayed_count"] > 0
         assert result["replay"]["status"] == "已完成"
+
+    def test_replay_batch_unknown_rule_fails(self, pipeline, sample_raw_logs):
+        pipeline.register_source("replay-miss-src", "http", "default")
+        pipeline.validate_source("replay-miss-src")
+        batch = pipeline.start_ingest_batch("replay-miss-src", "2026Q1", sample_raw_logs[:1])
+        batch_no = batch["batch"]["批次编号"]
+        pipeline.parse_batch(batch_no)
+
+        result = pipeline.replay_batch(batch_no, "no-such-rule")
+        assert result["ok"] is False
+        assert "不存在" in result["message"]
 
 
 class TestFailureRecovery:

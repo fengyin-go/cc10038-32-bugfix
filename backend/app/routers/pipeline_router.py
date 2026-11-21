@@ -93,8 +93,46 @@ def pipeline_parse_batch(payload: ParseBatchPayload) -> dict[str, Any]:
 
 
 @router.post("/batch/recover")
-def pipeline_recover_batch(batch_no: str = Query(..., min_length=1)) -> dict[str, Any]:
-    return pipeline.recover_batch(batch_no)
+def pipeline_recover_batch(
+    batch_no: str = Query(..., min_length=1),
+    parser_rule_name: str | None = Query(default=None),
+) -> dict[str, Any]:
+    return pipeline.recover_batch(batch_no, parser_rule_name)
+
+
+@router.get("/batch/{batch_no}/rule-verification")
+def pipeline_rule_verification(batch_no: str) -> dict[str, Any]:
+    """按批次导出一条批次的规则核验结果，可逐条核对明细字段来源。"""
+    from app.store import store
+
+    journals = [
+        entry for entry in store.rows("parse_journal")
+        if entry.get("批次编号") == batch_no
+    ]
+    entities = [
+        entry for entry in store.rows("parsed_entity")
+        if entry.get("来源批次") == batch_no
+    ]
+    return {
+        "batch_no": batch_no,
+        "journals": journals,
+        "entities": [
+            {
+                "id": e.get("id"),
+                "raw_record_id": e.get("原始记录ID"),
+                "parser_rule": e.get("parser_rule"),
+                "rule_requested": e.get("rule_requested"),
+                "rule_mode": e.get("rule_mode"),
+                "rule_version": e.get("rule_version"),
+                "rule_digest": e.get("rule_digest"),
+                "rule_field_signature": e.get("rule_field_signature"),
+                "rule_proof": e.get("rule_proof"),
+                "formal_detail": e.get("formal_detail"),
+                "fields": e.get("标准化字段集"),
+            }
+            for e in entities
+        ],
+    }
 
 
 @router.post("/dedup/run")

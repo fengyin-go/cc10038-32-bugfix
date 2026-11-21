@@ -4,12 +4,12 @@
 """
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import time
 from typing import Any
 
+from app.services import rule_proof as rp
 from app.store import store
 
 
@@ -28,6 +28,11 @@ def _next_id(module: str) -> int:
 
 class IngestPipeline:
     """采集流水线统一编排，管理从数据源到导出的完整数据链路。"""
+
+    # 并发测试观察点：解析暂存完成、正式落库之前触发。
+    # 默认 None，生产调用不会受影响；测试可用它把“指定规则恰好在此刻发布”
+    # 变成确定性场景，验证核验逻辑而不是靠线程调度碰运气。
+    parse_midpoint_hook = None
 
     # ---------- 阶段0：数据源登记与版本 ----------
     def register_source(self, source_id: str, protocol: str, region: str) -> dict[str, Any]:
@@ -143,80 +148,238 @@ class IngestPipeline:
         batch_no: str,
         parser_rule_name: str | None = None,
     ) -> dict[str, Any]:
-        """解析批次中的原始日志为标准化明细。"""
-        raw_records_list = store.rows("raw_records")
-        batch_raw = [r for r in raw_records_list if r.get("批次编号") == batch_no]
-        if not batch_raw:
-            return {"ok": False, "message": f"批次 {batch_no} 无原始日志记录"}
+        """解析批次中的原始日志为标准化明细。
 
-        # 查找匹配的解析规则
-        parsers = store.rows("field_parser")
-        rule = None
-        if parser_rule_name:
-            for p in parsers:
-                if p.get("规则名称") == parser_rule_name:
-                    rule = p
-                    break
-        if rule is None:
-            for p in parsers:
-                if p.get("status") == "已发布":
-                    rule = p
-                    break
-        if rule is None:
-            return {"ok": False, "message": "无可用解析规则，请先发布一条字段解析规则"}
+        规则选择是整个链路的信任根：
+        - 传空规则名（None / 空串）表示“未指定”，沿用已有的默认映射；
+        - 传了非空规则名就必须找到同名且已发布的规则，找不到直接报错，
+          绝不回退到默认规则或别的已发布规则；
+        - 规则快照在锁内冻结，明细写入前再次复核版本与指纹，只有能证明
+          使用了所指定规则的输出才进入正式明细。
 
-        # 获取当前 schema_version
-        schema_versions = store.rows("schema_version")
-        schema_ver = None
-        for sv in schema_versions:
-            if sv.get("status") == "已发布":
-                schema_ver = sv
-                break
+        解析计算刻意放在锁外，让“指定规则恰好在解析期间发布完成”成为
+        真实可达的并发窗口，而不是靠线程调度碰运气；提交阶段重新加锁并
+        复核规则身份。
+        """
+        requested = (parser_rule_name or "").strip() or None
 
+        # ---- 阶段 A：锁内读取批次快照并选择规则 ----
+        with store.lock:
+            batch_raw = [r for r in store.rows("raw_records")
+                         if r.get("批次编号") == batch_no]
+            if not batch_raw:
+                return {"ok": False, "message": f"批次 {batch_no} 无原始日志记录"}
+            selection = self._select_parser_rule(requested)
+            if not selection["ok"]:
+                return self._fail_without_rule(batch_no, requested, selection, batch_raw)
+            schema_ver = next(
+                (sv for sv in store.rows("schema_version")
+                 if sv.get("status") == "已发布"),
+                None,
+            )
+            snapshot_rows = [
+                {
+                    "id": r["id"],
+                    "body": r.get("原始正文", ""),
+                    "line_no": r.get("原始行号"),
+                    "status": r.get("status"),
+                }
+                for r in batch_raw
+            ]
+
+        # ---- 阶段 B：锁外计算解析结果（并发发布可以真实发生在这里） ----
+        staged, failed_ids, parse_counts, already_parsed = self._stage_parse(
+            snapshot_rows, selection
+        )
+        hook = type(self).parse_midpoint_hook
+        if hook is not None:
+            hook(self, batch_no, requested, selection)
+
+        # ---- 阶段 C：锁内复核并提交 ----
+        with store.lock:
+            return self._commit_parse(
+                batch_no=batch_no,
+                requested=requested,
+                selection=selection,
+                staged=staged,
+                failed_ids=failed_ids,
+                parse_counts=parse_counts,
+                already_parsed=already_parsed,
+                schema_ver=schema_ver,
+            )
+
+    def _stage_parse(
+        self,
+        snapshot_rows: list[dict[str, Any]],
+        selection: dict[str, Any],
+    ) -> tuple[
+        list[tuple[dict[str, Any], dict[str, Any]]],
+        list[int],
+        dict[str, int],
+        list[int],
+    ]:
+        """按选定的字段顺序解析正文，不改动任何共享状态。"""
+        staged: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        failed_ids: list[int] = []
+        parse_counts: dict[str, int] = {}
+        already_parsed: list[int] = []
+        for row in snapshot_rows:
+            if row["status"] == "已解析" and not selection["explicit"]:
+                # 未指定规则时沿用默认映射：已完成的原始行不重复解析。
+                already_parsed.append(row["id"])
+                continue
+            try:
+                fields, part_count, field_count = rp.parse_body(
+                    row["body"], selection["field_names"]
+                )
+                if selection["explicit"] and part_count != field_count:
+                    raise ValueError(
+                        f"字段数不匹配：正文 {part_count} 段，规则 {field_count} 字段"
+                    )
+                signature = ",".join(fields.keys())
+                staged.append((row, {
+                    "fields": fields,
+                    "field_signature": signature,
+                    "content_digest": _stable_digest(fields),
+                    "error": "",
+                }))
+                parse_counts[signature] = parse_counts.get(signature, 0) + 1
+            except Exception as exc:  # noqa: BLE001 - 失败原因要回写到处置链路
+                staged.append((row, {"fields": None, "error": str(exc)}))
+                failed_ids.append(row["id"])
+        return staged, failed_ids, parse_counts, already_parsed
+
+    def _commit_parse(
+        self,
+        *,
+        batch_no: str,
+        requested: str | None,
+        selection: dict[str, Any],
+        staged: list[tuple[dict[str, Any], dict[str, Any]]],
+        failed_ids: list[int],
+        parse_counts: dict[str, int],
+        already_parsed: list[int],
+        schema_ver: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """锁内复核规则身份，然后写入明细、日志和处置清单。"""
+        live_raw = {
+            r["id"]: r for r in store.rows("raw_records")
+            if r.get("批次编号") == batch_no
+        }
+        verification = self._verify_rule_unchanged(selection)
+        if not verification["ok"]:
+            # 核验失败：本次暂存结果作废，不写入任何明细。
+            # 指定规则没能兑现，之前的结果也无法证明是按该规则产出的，
+            # 一并退出正式明细（保留行以便追溯），避免错位明细残留。
+            superseded = []
+            if selection["explicit"]:
+                superseded = self._supersede_batch_entities(
+                    batch_no, "规则核验失败：" + verification["message"]
+                )
+            covered = {
+                str(e.get("原始记录ID"))
+                for e in store.rows("parsed_entity")
+                if e.get("来源批次") == batch_no and e.get("formal_detail") is not False
+            }
+            pending_raw = [
+                r for r in live_raw.values() if str(r["id"]) not in covered
+            ]
+            raw_ids = [r["id"] for r in pending_raw]
+            self._mark_raw_pending(pending_raw, verification["message"])
+            self._enqueue_retry(batch_no, raw_ids, selection, verification["message"])
+            journal_entry = self._write_parse_journal(
+                batch_no=batch_no,
+                success=0,
+                failure=len(raw_ids),
+                status="失败",
+                result="失败",
+                requested_rule=requested,
+                rule_selection={**selection, "ok": False, "reason": "rule_changed"},
+                failed_ids=raw_ids,
+                parse_counts={},
+                note=verification["message"],
+                skipped_already_parsed=already_parsed,
+                superseded_entities=superseded,
+            )
+            return {
+                "ok": False,
+                "message": verification["message"],
+                "rule_verification": verification,
+                "rule_selection": {k: v for k, v in selection.items() if k != "rule"},
+                "journal_id": journal_entry["id"],
+                "failed_ids": raw_ids,
+                "pending_record_ids": raw_ids,
+                "skipped_already_parsed": already_parsed,
+                "superseded_entity_ids": superseded,
+            }
+
+        superseded: list[int] = []
+        if selection["explicit"]:
+            # 显式指定规则是一次权威重做：旧明细（可能来自默认映射或旧字段
+            # 顺序）退出正式明细，但保留行以备追溯，原始行号保持不变。
+            superseded = self._supersede_batch_entities(batch_no, "按指定规则重做")
+
+        rule = selection["rule"]
+        rule_snapshot = selection["snapshot"]
         parsed_entities = store.rows("parsed_entity")
         success_count = 0
-        failure_count = 0
         parsed_ids: list[int] = []
-        failed_ids: list[int] = []
+        live_failed_ids: list[int] = []
 
-        for raw in batch_raw:
-            raw_id = raw["id"]
-            try:
-                # 模拟字段解析：将原始正文按规则打散
-                body = raw.get("原始正文", "")
-                fields = self._parse_body(body, rule)
-                ent_id = _next_id("parsed_entity")
-                entity = {
-                    "id": ent_id,
-                    "来源批次": batch_no,
-                    "原始记录ID": str(raw_id),
-                    "解析规则版本": rule.get("规则名称", "unknown"),
-                    "标准化字段集": json.dumps(fields, ensure_ascii=False),
-                    "校验状态": "",
-                    "status": "待校验",
-                    "pending": True,
-                    "abnormal": False,
-                    "parser_rule": rule.get("规则名称"),
-                    "schema_version": schema_ver.get("版本号") if schema_ver else "v1.0",
-                    "parsed_at": _now_iso(),
-                    "content_digest": _stable_digest(fields),
-                }
-                parsed_entities.append(entity)
-                raw["status"] = "已解析"
-                raw["pending"] = False
-                raw["解析状态"] = "已解析"
-                success_count += 1
-                parsed_ids.append(ent_id)
-            except Exception:
+        for row, parsed in staged:
+            raw = live_raw.get(row["id"])
+            if raw is None:
+                continue
+            if parsed["fields"] is None:
                 raw["status"] = "解析失败"
                 raw["解析状态"] = "解析失败"
                 raw["abnormal"] = True
-                failure_count += 1
-                failed_ids.append(raw_id)
+                raw["parse_error"] = parsed["error"]
+                live_failed_ids.append(raw["id"])
+                continue
+            ent_id = _next_id("parsed_entity")
+            entity = {
+                "id": ent_id,
+                "来源批次": batch_no,
+                "原始记录ID": str(raw["id"]),
+                "解析规则版本": rule.get("规则名称", "unknown"),
+                "标准化字段集": json.dumps(parsed["fields"], ensure_ascii=False),
+                "校验状态": "",
+                "status": "待校验",
+                "pending": True,
+                "abnormal": False,
+                "parser_rule": rule.get("规则名称"),
+                "schema_version": schema_ver.get("版本号") if schema_ver else "v1.0",
+                "parsed_at": rp.now_iso(),
+                "content_digest": parsed["content_digest"],
+                # 规则核验证据：请求的是哪条规则、实际用了哪条、字段顺序是什么、
+                # 是否回退到默认映射，全部随明细落库。
+                "rule_requested": requested or "",
+                "rule_mode": "explicit" if selection["explicit"] else "default",
+                "rule_fallback": selection["explicit"] is False,
+                "rule_id": rule_snapshot["rule_id"],
+                "rule_version": rule_snapshot["rule_version"],
+                "rule_digest": rule_snapshot["rule_digest"],
+                "rule_field_signature": parsed["field_signature"],
+                "rule_verified": True,
+                "rule_proof": verification["proof"],
+                "formal_detail": True,
+                "raw_line_no": raw.get("原始行号"),
+            }
+            parsed_entities.append(entity)
+            raw["status"] = "已解析"
+            raw["pending"] = False
+            raw["解析状态"] = "已解析"
+            raw["abnormal"] = False
+            raw["parse_error"] = ""
+            success_count += 1
+            parsed_ids.append(ent_id)
+
+        live_failed_ids = list(dict.fromkeys(live_failed_ids))
+        failure_count = len(live_failed_ids)
 
         # 更新批次状态
-        batches = store.rows("ingest_batch")
-        for b in batches:
+        for b in store.rows("ingest_batch"):
             if b.get("批次编号") == batch_no:
                 b["status"] = "已完成" if failure_count == 0 else "部分失败"
                 b["pending"] = failure_count > 0
@@ -225,65 +388,510 @@ class IngestPipeline:
                 b["batch_version"] = b.get("batch_version", 1) + 1
                 break
 
-        # 记录解析日志
-        journal = store.rows("parse_journal")
-        journal_entry = {
-            "id": _next_id("parse_journal"),
-            "操作类型": "批量解析",
-            "批次编号": batch_no,
-            "执行时间": _now_iso(),
-            "影响的记录数": str(success_count),
-            "执行结果": "成功" if failure_count == 0 else "部分成功",
-            "status": "成功" if failure_count == 0 else "部分成功",
-            "pending": failure_count > 0,
-            "abnormal": failure_count > 0,
-            "success_count": str(success_count),
-            "failure_count": str(failure_count),
-        }
-        journal.append(journal_entry)
+        journal_status = "成功" if failure_count == 0 else "部分成功"
+        journal_entry = self._write_parse_journal(
+            batch_no=batch_no,
+            success=success_count,
+            failure=failure_count,
+            status=journal_status,
+            result=journal_status,
+            requested_rule=requested,
+            rule_selection=selection,
+            failed_ids=live_failed_ids,
+            parse_counts=parse_counts,
+            note="",
+            skipped_already_parsed=already_parsed,
+            superseded_entities=superseded,
+        )
 
-        # 失败记录进入重试队列
-        if failure_count > 0:
-            retry_q = store.rows("retry_queue")
-            for fid in failed_ids:
-                retry_entry = {
-                    "id": _next_id("retry_queue"),
-                    "失败记录ID": str(fid),
-                    "失败原因": "字段解析失败",
-                    "重试次数": "0",
-                    "最大重试": "3",
-                    "下次重试时间": _now_iso(),
-                    "status": "待重试",
-                    "pending": True,
-                    "abnormal": False,
-                    "batch_no": batch_no,
-                    "parser_rule": rule.get("规则名称"),
-                }
-                retry_q.append(retry_entry)
+        succeeded_raw_ids: list[int] = []
+        for ent_id in parsed_ids:
+            entity = store.find("parsed_entity", ent_id)
+            if entity is None:
+                continue
+            entity["parse_journal_id"] = journal_entry["id"]
+            succeeded_raw_ids.append(int(entity["原始记录ID"]))
+        for raw_id in succeeded_raw_ids:
+            raw = live_raw.get(raw_id)
+            if raw is not None:
+                raw["parse_journal_id"] = journal_entry["id"]
+
+        # 补做成功：处置清单里的同一原始行关闭待办，并回写核验日志。
+        resolved = self._resolve_retry_entries(batch_no, succeeded_raw_ids)
+        journal_entry["resolved_record_ids"] = json.dumps(resolved)
+        journal_entry["resolved_record_count"] = str(len(resolved))
+
+        # 失败记录进入处置清单（重试队列），并保留可读原文。
+        self._enqueue_retry(batch_no, live_failed_ids, selection, "")
 
         return {
             "ok": True,
             "message": f"批次 {batch_no} 解析完成",
             "success": success_count,
             "failure": failure_count,
+            "skipped_already_parsed": already_parsed,
+            "superseded_entity_ids": superseded,
             "parsed_ids": parsed_ids,
-            "failed_ids": failed_ids,
+            "failed_ids": live_failed_ids,
+            "journal_id": journal_entry["id"],
+            "rule_selection": {k: v for k, v in selection.items() if k != "rule"},
+            "rule_verification": {
+                "requested_rule": requested or "",
+                "resolved_rule": rule.get("规则名称"),
+                "mode": "explicit" if selection["explicit"] else "default",
+                "fallback": selection["explicit"] is False,
+                "rule_version": rule_snapshot["rule_version"],
+                "rule_digest": rule_snapshot["rule_digest"],
+                "proof": verification["proof"],
+                "field_order": selection["field_names"],
+                "field_signature": rule_snapshot["field_signature"],
+                "matched_entities": sum(parse_counts.values()),
+                "unmatched_entities": failure_count,
+                "observed_field_signatures": parse_counts,
+            },
         }
 
-    def _parse_body(self, body: str, rule: dict[str, Any]) -> dict[str, Any]:
-        """模拟字段解析逻辑。种子数据中的规则可能只有占位文本，此时使用默认字段名。"""
-        parts = body.split("|") if "|" in body else [body]
-        raw_field_list = (rule.get("输出字段列表", "") or "").strip()
-        # 识别真实字段列表：含逗号分隔且每段不超过20字
-        if raw_field_list and "," in raw_field_list:
-            field_names = [f.strip() for f in raw_field_list.split(",")]
+    def _fail_without_rule(
+        self,
+        batch_no: str,
+        requested: str | None,
+        selection: dict[str, Any],
+        batch_raw: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """指定规则无法兑现时的统一失败路径。调用方必须已持有 store.lock。"""
+        # 规则找不到时不得动用默认映射，否则成功日志背后是错位字段。
+        # 显式指定但无法兑现时，整批原始行都视为“未按指定规则完成”：
+        # 原始行退回待解析、原文保持可读，旧明细降级为非正式，等待补做。
+        previous = self._supersede_batch_entities(batch_no, selection["message"])
+        pending_ids = [r["id"] for r in batch_raw]
+        self._mark_raw_pending(batch_raw, selection["message"])
+        self._enqueue_retry(batch_no, pending_ids, selection, selection["message"])
+        journal_entry = self._write_parse_journal(
+            batch_no=batch_no,
+            success=0,
+            failure=len(pending_ids),
+            status="失败",
+            result="失败",
+            requested_rule=requested,
+            rule_selection=selection,
+            failed_ids=pending_ids,
+            parse_counts={},
+            note=selection["message"],
+            superseded_entities=previous,
+        )
+        return {
+            "ok": False,
+            "message": selection["message"],
+            "rule_selection": selection,
+            "journal_id": journal_entry["id"],
+            "failed_ids": pending_ids,
+            "pending_record_ids": pending_ids,
+            "superseded_entity_ids": previous,
+        }
+
+    def _find_rule_by_id(self, rule_id: Any) -> dict[str, Any] | None:
+        if rule_id is None:
+            return None
+        for rule in store.rows("field_parser"):
+            if rule.get("id") == rule_id:
+                return rule
+        return None
+
+    def _verify_rule_unchanged(self, selection: dict[str, Any]) -> dict[str, Any]:
+        """复核执行期间规则没有被重新发布。
+
+        默认映射模式没有“指定规则”可证明，沿用历史行为；显式模式必须在写入
+        前再次确认规则版本和指纹与解析开始时一致。
+        """
+        snapshot = selection.get("snapshot") or {}
+        rule_name = (selection.get("rule") or {}).get("规则名称")
+        if not selection.get("explicit"):
+            # 默认映射：没有指定规则时，如果实际借用了某条已发布规则，
+            # 同样要确认它在解析期间没有被换版本；纯内置默认映射天然稳定。
+            if snapshot.get("rule_id") is None:
+                return {
+                    "ok": True,
+                    "proof": "default_mapping",
+                    "message": "未指定规则名，使用内置默认字段映射",
+                    "expected_digest": snapshot.get("rule_digest", ""),
+                    "actual_digest": snapshot.get("rule_digest", ""),
+                }
+            current = self._find_rule_by_id(snapshot.get("rule_id"))
+            current_snapshot = rp.rule_snapshot(current) if current else None
+            if current_snapshot is not None and current_snapshot["rule_digest"] == snapshot.get("rule_digest"):
+                return {
+                    "ok": True,
+                    "proof": "default_mapping",
+                    "message": "未指定规则名，沿用的已发布规则在执行期间未变化",
+                    "expected_digest": snapshot.get("rule_digest", ""),
+                    "actual_digest": current_snapshot["rule_digest"],
+                }
+            return {
+                "ok": False,
+                "proof": "unproven",
+                "reason": "rule_changed",
+                "message": (
+                    f"未指定规则名时沿用的已发布规则「{rule_name}」在解析期间被重新发布，"
+                    "本次输出不进入正式明细"
+                ),
+                "expected_digest": snapshot.get("rule_digest", ""),
+                "actual_digest": current_snapshot["rule_digest"] if current_snapshot else "",
+            }
+        current = None
+        for candidate in store.rows("field_parser"):
+            if candidate.get("规则名称") == rule_name:
+                current = candidate
+                break
+        if current is None:
+            return {
+                "ok": False,
+                "proof": "unproven",
+                "reason": "rule_changed",
+                "message": f"解析期间指定规则「{rule_name}」被移除，结果不进入正式明细",
+                "expected_digest": snapshot.get("rule_digest", ""),
+                "actual_digest": "",
+            }
+        current_snapshot = rp.rule_snapshot(current)
+        same = (
+            current.get("status") == "已发布"
+            and current_snapshot["rule_digest"] == snapshot.get("rule_digest")
+        )
+        if not same:
+            return {
+                "ok": False,
+                "proof": "unproven",
+                "reason": "rule_changed",
+                "message": (
+                    f"解析期间指定规则「{rule_name}」被重新发布"
+                    f"（版本 {snapshot.get('rule_version')} → {current_snapshot['rule_version']}），"
+                    "本次输出无法证明使用了指定版本，不进入正式明细"
+                ),
+                "expected_digest": snapshot.get("rule_digest", ""),
+                "actual_digest": current_snapshot["rule_digest"],
+            }
+        return {
+            "ok": True,
+            "proof": "explicit_verified",
+            "message": f"指定规则「{rule_name}」版本与指纹复核一致",
+            "expected_digest": snapshot.get("rule_digest", ""),
+            "actual_digest": current_snapshot["rule_digest"],
+        }
+
+    def _mark_raw_pending(self, batch_raw: list[dict[str, Any]], reason: str) -> None:
+        """规则核验失败时原始行保持待解析，原文可读，编号不变。"""
+        for raw in batch_raw:
+            raw["status"] = "待解析"
+            raw["解析状态"] = "待解析"
+            raw["pending"] = True
+            raw["abnormal"] = False
+            raw["parse_error"] = reason
+
+    def _supersede_batch_entities(self, batch_no: str, reason: str) -> list[int]:
+        """把该批次此前作为正式明细的结果降级。
+
+        指定规则找不到时，历史结果很可能来自默认映射或另一条规则。它们必须
+        退出正式明细，否则“解析失败”的日志旁边仍残留着字段错位的明细。
+        记录本身保留，便于追溯，但 formal_detail 置为 False。
+        """
+        superseded: list[int] = []
+        for entity in store.rows("parsed_entity"):
+            if entity.get("来源批次") != batch_no:
+                continue
+            if entity.get("status") in ("已作废",) or entity.get("formal_detail") is False:
+                continue
+            entity["formal_detail"] = False
+            entity["rule_proof"] = "superseded"
+            entity["status"] = "校验失败"
+            entity["校验状态"] = "已作废"
+            entity["pending"] = False
+            entity["abnormal"] = True
+            entity["invalidated_reason"] = reason
+            entity["invalidated_at"] = rp.now_iso()
+            superseded.append(int(entity.get("id", 0)))
+        return superseded
+
+    def _enqueue_retry(
+        self,
+        batch_no: str,
+        failed_ids: list[int],
+        selection: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """把失败/待补做的原始行登记进处置清单，原文保持可读。"""
+        if not failed_ids:
+            return
+        retry_q = store.rows("retry_queue")
+        raw_by_id = {int(r.get("id", 0)): r for r in store.rows("raw_records")}
+        snapshot = selection.get("snapshot") or {}
+        for fid in failed_ids:
+            raw = raw_by_id.get(int(fid))
+            if raw is None:
+                continue
+            existing = next(
+                (r for r in retry_q if r.get("失败记录ID") == str(fid)
+                 and r.get("batch_no") == batch_no and r.get("status") == "待重试"),
+                None,
+            )
+            if existing is not None:
+                # 同一原始行只保留一条待处置登记，不能按解析次数重复累计。
+                existing["pending_raw_body"] = raw.get("原始正文", "")
+                existing["rule_reason"] = reason or existing.get("rule_reason", "")
+                continue
+            retry_entry = {
+                "id": _next_id("retry_queue"),
+                "失败记录ID": str(fid),
+                "失败原因": reason or "字段解析失败",
+                "重试次数": "0",
+                "最大重试": "3",
+                "下次重试时间": rp.now_iso(),
+                "status": "待重试",
+                "pending": True,
+                "abnormal": False,
+                "batch_no": batch_no,
+                "parser_rule": (selection.get("rule") or {}).get("规则名称"),
+                "rule_reason": selection.get("reason", ""),
+                "rule_digest": snapshot.get("rule_digest", ""),
+                # 待补做原文必须可读，且记录原始行号；补做时沿用同一 raw id。
+                "raw_line_no": raw.get("原始行号"),
+                "pending_raw_body": raw.get("原始正文", ""),
+            }
+            retry_q.append(retry_entry)
+
+    def _resolve_retry_entries(self, batch_no: str, raw_ids: list[int]) -> list[int]:
+        """原始行补做成功后，关闭处置清单里对应的待办登记。"""
+        if not raw_ids:
+            return []
+        targets = {str(rid) for rid in raw_ids}
+        resolved: list[int] = []
+        for entry in store.rows("retry_queue"):
+            if (
+                entry.get("batch_no") == batch_no
+                and entry.get("失败记录ID") in targets
+                and entry.get("status") in ("待重试", "重试中")
+            ):
+                entry["status"] = "已补做"
+                entry["pending"] = False
+                entry["abnormal"] = False
+                entry["resolved_at"] = rp.now_iso()
+                resolved.append(int(entry.get("失败记录ID", 0)))
+        return resolved
+
+    def _select_parser_rule(self, parser_rule_name: str | None) -> dict[str, Any]:
+        """选择解析规则，并把“为什么是这条规则”记录成可核验结构。"""
+        parsers = store.rows("field_parser")
+
+        if not parser_rule_name:
+            # 未指定名称：兼容已有行为，优先使用已发布规则，其次沿用默认映射。
+            rule = None
+            for p in parsers:
+                if p.get("status") == "已发布":
+                    rule = p
+                    break
+            if rule is not None:
+                explicit_fields = rp.normalize_output_fields(rule.get("输出字段列表"))
+                field_names = explicit_fields or list(rp.DEFAULT_FIELDS)
+                snapshot = rp.rule_snapshot(rule)
+                return {
+                    "ok": True,
+                    "explicit": False,
+                    "mode": "default",
+                    "rule": rule,
+                    "snapshot": snapshot,
+                    "field_names": field_names,
+                    "used_default_fields": explicit_fields is None,
+                    "message": "未指定规则名，沿用已发布规则",
+                }
+            placeholder = {
+                "id": None,
+                "规则名称": "default",
+                "status": "默认",
+                "rule_version": 0,
+                "输出字段列表": ",".join(rp.DEFAULT_FIELDS),
+            }
+            snapshot = rp.rule_snapshot(placeholder)
+            return {
+                "ok": True,
+                "explicit": False,
+                "mode": "default",
+                "rule": placeholder,
+                "snapshot": snapshot,
+                "field_names": list(rp.DEFAULT_FIELDS),
+                "used_default_fields": True,
+                "message": "未指定规则名且无已发布规则，使用默认字段映射",
+            }
+
+        matches = [p for p in parsers if p.get("规则名称") == parser_rule_name]
+        if not matches:
+            return {
+                "ok": False,
+                "explicit": True,
+                "mode": "explicit",
+                "requested_rule": parser_rule_name,
+                "rule": None,
+                "snapshot": None,
+                "field_names": [],
+                "reason": "not_found",
+                "message": f"指定的解析规则「{parser_rule_name}」不存在，已停止解析，未回退默认规则",
+            }
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "explicit": True,
+                "mode": "explicit",
+                "requested_rule": parser_rule_name,
+                "rule": None,
+                "snapshot": None,
+                "field_names": [],
+                "reason": "ambiguous",
+                "message": (
+                    f"指定的解析规则「{parser_rule_name}」存在 {len(matches)} 条同名记录，"
+                    "无法确定使用哪一条，已停止解析"
+                ),
+            }
+        rule = matches[0]
+        if rule.get("status") != "已发布":
+            return {
+                "ok": False,
+                "explicit": True,
+                "mode": "explicit",
+                "requested_rule": parser_rule_name,
+                "rule": rule,
+                "snapshot": rp.rule_snapshot(rule),
+                "field_names": [],
+                "reason": "not_published",
+                "message": (
+                    f"指定的解析规则「{parser_rule_name}」当前状态为"
+                    f"「{rule.get('status')}」，尚未发布，已停止解析"
+                ),
+            }
+        explicit_fields = rp.normalize_output_fields(rule.get("输出字段列表"))
+        if explicit_fields is None:
+            return {
+                "ok": False,
+                "explicit": True,
+                "mode": "explicit",
+                "requested_rule": parser_rule_name,
+                "rule": rule,
+                "snapshot": rp.rule_snapshot(rule),
+                "field_names": [],
+                "reason": "no_field_mapping",
+                "message": (
+                    f"指定的解析规则「{parser_rule_name}」没有可核验的输出字段列表，"
+                    "已停止解析，不使用默认字段映射"
+                ),
+            }
+        snapshot = rp.rule_snapshot(rule)
+        return {
+            "ok": True,
+            "explicit": True,
+            "mode": "explicit",
+            "rule": rule,
+            "snapshot": snapshot,
+            "field_names": explicit_fields,
+            "used_default_fields": False,
+            "message": f"使用指定规则「{parser_rule_name}」",
+        }
+
+    def _write_parse_journal(
+        self,
+        *,
+        batch_no: str,
+        success: int,
+        failure: int,
+        status: str,
+        result: str,
+        requested_rule: str | None,
+        rule_selection: dict[str, Any],
+        failed_ids: list[int],
+        parse_counts: dict[str, int],
+        note: str,
+        skipped_already_parsed: list[int] | None = None,
+        superseded_entities: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """写解析操作日志。无论成功失败，都带上规则核验结果和待处置原文。"""
+        skipped_already_parsed = skipped_already_parsed or []
+        superseded_entities = superseded_entities or []
+        snapshot = rule_selection.get("snapshot") or {}
+        rule = rule_selection.get("rule") or {}
+        mode = "explicit" if rule_selection.get("explicit") else "default"
+        # 规则核验：显式指定且全部成功才算“可证明”；默认映射按历史行为放行，
+        # 但日志要明确标注它不可用于证明“用了所指定规则”。
+        selection_ok = bool(rule_selection.get("ok", False))
+        explicit = bool(rule_selection.get("explicit"))
+        proven = selection_ok and explicit and success > 0 and failure == 0
+        # 有产出才谈得上进入正式明细；核验是否可证明由 rule_verified 单独标记。
+        formal_detail = selection_ok and success > 0
+        proof_label = (
+            "explicit_verified" if proven
+            else "default_mapping" if selection_ok and not explicit
+            else "unproven"
+        )
+        journal_entry = {
+            "id": _next_id("parse_journal"),
+            "操作类型": "批量解析",
+            "批次编号": batch_no,
+            "执行时间": rp.now_iso(),
+            "影响的记录数": str(success),
+            "执行结果": result,
+            "status": status,
+            "pending": status != "成功",
+            "abnormal": status == "失败",
+            "success_count": str(success),
+            "failure_count": str(failure),
+            # 规则核验结果：请求、解析到、模式、版本、指纹、字段顺序、是否回退。
+            "requested_rule": requested_rule or "",
+            "resolved_rule": rule.get("规则名称"),
+            "rule_mode": mode,
+            "rule_fallback": bool(rule_selection.get("explicit") is False),
+            "rule_reason": rule_selection.get("reason", ""),
+            "rule_version": snapshot.get("rule_version"),
+            "rule_digest": snapshot.get("rule_digest", ""),
+            "field_signature": snapshot.get("field_signature", ""),
+            "field_order": json.dumps(
+                (snapshot.get("output_fields") or rule_selection.get("field_names") or []),
+                ensure_ascii=False,
+            ),
+            "observed_field_signatures": json.dumps(parse_counts, ensure_ascii=False),
+            "rule_verified": bool(proven),
+            "rule_proof": proof_label,
+            "formal_detail": bool(formal_detail),
+            "skipped_parsed_record_ids": json.dumps(skipped_already_parsed),
+            "skipped_parsed_count": str(len(skipped_already_parsed)),
+            "superseded_entity_ids": json.dumps(superseded_entities),
+            "superseded_entity_count": str(len(superseded_entities)),
+            "failed_record_ids": json.dumps(failed_ids),
+            "failed_record_count": str(len(failed_ids)),
+            "note": note,
+        }
+        if failed_ids:
+            # 待补做原文快照：retry_queue 里要有可读原文，不能只剩一个 ID。
+            raw_by_id = {int(r.get("id", 0)): r for r in store.rows("raw_records")}
+            pending_rows = []
+            for fid in failed_ids:
+                raw = raw_by_id.get(int(fid))
+                if raw is None:
+                    continue
+                pending_rows.append({
+                    "raw_id": raw.get("id"),
+                    "line_no": raw.get("原始行号"),
+                    "body": raw.get("原始正文"),
+                    "batch_no": raw.get("批次编号"),
+                    "error": raw.get("parse_error", ""),
+                })
+            journal_entry["pending_raw_rows"] = json.dumps(pending_rows, ensure_ascii=False)
+            journal_entry["pending_raw_count"] = str(len(pending_rows))
         else:
-            field_names = ["time", "level", "message"]
-        fields: dict[str, Any] = {}
-        for i, fn in enumerate(field_names):
-            fn = fn.strip()
-            if fn:
-                fields[fn] = parts[i].strip() if i < len(parts) else ""
+            journal_entry["pending_raw_rows"] = "[]"
+            journal_entry["pending_raw_count"] = "0"
+        store.rows("parse_journal").append(journal_entry)
+        return journal_entry
+
+    def _parse_body(self, body: str, rule: dict[str, Any]) -> dict[str, Any]:
+        """兼容旧调用：按规则字段顺序解析；无字段列表时使用默认字段名。"""
+        field_names = rp.normalize_output_fields(rule.get("输出字段列表")) or list(
+            rp.DEFAULT_FIELDS
+        )
+        fields, _, _ = rp.parse_body(body, field_names)
         return fields
 
     # ---------- 阶段3：去重 ----------
@@ -578,39 +1186,68 @@ class IngestPipeline:
         history_batch_range: str,
         new_parser_rule: str,
     ) -> dict[str, Any]:
-        """用新解析规则版本回溯重放历史批次。"""
-        replayers = store.rows("replay_engine")
+        """用新解析规则版本回溯重放历史批次。
 
-        replay_id = _next_id("replay_engine")
-        replay_entry = {
-            "id": replay_id,
-            "历史批次范围": history_batch_range,
-            "新解析规则版本": new_parser_rule,
-            "重放状态": "已创建",
-            "产出记录数": "0",
-            "执行时间": _now_iso(),
-            "status": "重放中",
-            "pending": True,
-            "abnormal": False,
+        重放必须真正按新规则重新解析，不能只把明细的“解析规则版本”标签改掉
+        ——那会再次制造“日志说用了新规则、字段其实没变”的错位。找不到规则
+        时直接失败，不生成重放任务。
+        """
+        with store.lock:
+            selection = self._select_parser_rule((new_parser_rule or "").strip() or None)
+            if not selection["ok"]:
+                return {
+                    "ok": False,
+                    "message": selection["message"],
+                    "rule_selection": selection,
+                }
+
+            replayers = store.rows("replay_engine")
+            replay_id = _next_id("replay_engine")
+            replay_entry = {
+                "id": replay_id,
+                "历史批次范围": history_batch_range,
+                "新解析规则版本": new_parser_rule,
+                "重放状态": "已创建",
+                "产出记录数": "0",
+                "执行时间": _now_iso(),
+                "status": "重放中",
+                "pending": True,
+                "abnormal": False,
+                "rule_version": selection["snapshot"]["rule_version"],
+                "rule_digest": selection["snapshot"]["rule_digest"],
+                "rule_proof": "explicit_verified",
+            }
+            replayers.append(replay_entry)
+
+        # 历史批次范围既可能是单个批次号，也可能是逗号分隔的批次列表。
+        wanted = {
+            part.strip() for part in str(history_batch_range).replace("，", ",").split(",")
+            if part.strip()
         }
-        replayers.append(replay_entry)
+        batch_nos = [
+            b.get("批次编号") for b in store.rows("ingest_batch")
+            if b.get("批次编号") in wanted
+        ]
 
-        # 对历史批次的原始日志重新解析
-        parsed = store.rows("parsed_entity")
-        replay_count = 0
-        for entity in parsed:
-            if entity.get("status") == "校验通过":
-                entity["status"] = "待校验"
-                entity["pending"] = True
-                entity["解析规则版本"] = new_parser_rule
-                entity["replay_id"] = str(replay_id)
-                entity["replayed_at"] = _now_iso()
-                replay_count += 1
+        results = [self.parse_batch(batch_no, new_parser_rule) for batch_no in batch_nos]
+        replay_count = sum(int(r.get("success", 0)) for r in results if r.get("ok"))
 
-        replay_entry["产出记录数"] = str(replay_count)
-        replay_entry["status"] = "已完成"
-        replay_entry["pending"] = False
-        replay_entry["重放状态"] = "已完成"
+        with store.lock:
+            replay_entry["产出记录数"] = str(replay_count)
+            replay_entry["status"] = "已完成" if all(r.get("ok") for r in results) else "部分失败"
+            replay_entry["pending"] = not all(r.get("ok") for r in results)
+            replay_entry["abnormal"] = not all(r.get("ok") for r in results)
+            replay_entry["重放状态"] = "已完成" if replay_entry["status"] == "已完成" else "部分失败"
+            replay_entry["batch_results"] = [
+                {
+                    "batch_no": batch_no,
+                    "ok": result.get("ok"),
+                    "success": result.get("success", 0),
+                    "failure": result.get("failure", 0),
+                    "journal_id": result.get("journal_id"),
+                }
+                for batch_no, result in zip(batch_nos, results)
+            ]
 
         return {
             "ok": True,
@@ -709,54 +1346,72 @@ class IngestPipeline:
         }
 
     # ---------- 失败恢复 ----------
-    def recover_batch(self, batch_no: str) -> dict[str, Any]:
-        """恢复失败的采集批次：重试解析失败记录。"""
-        retry_q = store.rows("retry_queue")
-        raw_records_list = store.rows("raw_records")
+    def recover_batch(
+        self,
+        batch_no: str,
+        parser_rule_name: str | None = None,
+    ) -> dict[str, Any]:
+        """把失败/待解析的原始行重新送回解析链路。
 
-        failed_raw = [r for r in raw_records_list
-                      if r.get("批次编号") == batch_no and r.get("status") == "解析失败"]
+        恢复只负责把原始行恢复成“待解析”，真正的产出仍统一由 parse_batch
+        按指定规则生成，保证补做与首次解析走同一套核验逻辑，且原始行号不变。
+        """
+        requested = (parser_rule_name or "").strip() or None
+        with store.lock:
+            retry_q = store.rows("retry_queue")
+            raw_records_list = store.rows("raw_records")
 
-        recovered = 0
-        still_failed = 0
-        for raw in failed_raw:
-            # 查找对应重试记录
-            retry_entry = None
-            for r in retry_q:
-                if r.get("失败记录ID") == str(raw["id"]):
-                    retry_entry = r
-                    break
-            if retry_entry:
-                retry_count = int(retry_entry.get("重试次数", "0"))
-                max_retry = int(retry_entry.get("最大重试", "3"))
-                if retry_count >= max_retry:
-                    retry_entry["status"] = "超过上限"
-                    still_failed += 1
-                    continue
-                retry_entry["重试次数"] = str(retry_count + 1)
-                retry_entry["status"] = "重试中"
-                retry_entry["下次重试时间"] = _now_iso()
+            failed_raw = [r for r in raw_records_list
+                          if r.get("批次编号") == batch_no
+                          and r.get("status") in ("解析失败", "待解析")]
 
-            # 重试解析
-            body = raw.get("原始正文", "")
-            parts = body.split("|") if "|" in body else [body]
-            if len(parts) >= 2:
-                raw["status"] = "待解析" if retry_entry else raw["status"]
+            recovered = 0
+            still_failed = 0
+            for raw in failed_raw:
+                retry_entry = None
+                for r in retry_q:
+                    if (r.get("失败记录ID") == str(raw["id"])
+                            and r.get("batch_no") == batch_no
+                            and r.get("status") in ("待重试", "重试中")):
+                        retry_entry = r
+                        break
+                if retry_entry:
+                    retry_count = int(retry_entry.get("重试次数", "0"))
+                    max_retry = int(retry_entry.get("最大重试", "3"))
+                    if retry_count >= max_retry:
+                        retry_entry["status"] = "超过上限"
+                        still_failed += 1
+                        continue
+                    retry_entry["重试次数"] = str(retry_count + 1)
+                    retry_entry["status"] = "重试中"
+                    retry_entry["下次重试时间"] = _now_iso()
+
+                # 不改变原始日志编号：沿用同一 raw id，只把它放回待解析队列。
+                raw["status"] = "待解析"
                 raw["解析状态"] = "待解析"
                 raw["pending"] = True
                 raw["abnormal"] = False
                 recovered += 1
-            else:
-                raw["status"] = "解析失败"
-                raw["abnormal"] = True
-                still_failed += 1
 
-        return {
-            "ok": True,
-            "message": f"批次 {batch_no} 恢复完成",
-            "recovered": recovered,
-            "still_failed": still_failed,
-        }
+            if recovered and requested is not None:
+                # parse_batch 自己加锁，这里用可重入锁无碍；调用时仍持锁避免
+                # 恢复与并发解析交错把同一原始行计两次。
+                result = self.parse_batch(batch_no, requested)
+                return {
+                    "ok": result["ok"],
+                    "message": result["message"],
+                    "recovered": recovered,
+                    "still_failed": still_failed,
+                    "parse_result": result,
+                }
+
+            return {
+                "ok": True,
+                "message": f"批次 {batch_no} 恢复完成，等待指定规则后重新解析",
+                "recovered": recovered,
+                "still_failed": still_failed,
+                "pending_rule": requested,
+            }
 
 
 pipeline = IngestPipeline()

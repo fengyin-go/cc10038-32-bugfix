@@ -79,5 +79,31 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 解析规则核验
+
+解析入口（`app/services/pipeline.py` 的 `parse_batch`）不再静默回退：
+
+- **空规则名 = 未指定**：沿用已有默认映射（有已发布规则时优先用它），保持历史兼容。
+- **非空规则名必须精确命中一条已发布规则**：不存在、未发布、同名多条、没有可核验的
+  输出字段列表都会直接报错，不产出任何正式明细，也不会回退到默认字段。
+- 规则快照冻结在 `app/services/rule_proof.py`，每条明细都带 `rule_version`、
+  `rule_digest`、`rule_field_signature`、`rule_proof`、`formal_detail`，可与解析
+  操作日志逐条核对。
+- 解析计算在锁外进行、提交前在锁内复核规则指纹。指定规则恰好在解析期间被重新发布时，
+  本次输出标记为 `unproven`，不进入正式明细；旧明细一并退出正式集，原文退回待解析。
+- 失败/待补做的原始行按规则核验结果登记进处置清单（`retry_queue`），保留可读原文与
+  原始行号；补做沿用同一 `raw id`，不会改写原始日志编号，也不会把同一次成功计两遍。
+- 发布规则/弃用规则（`field_parser` 服务动作）会递增 `rule_version` 并刷新指纹。
+
+核对接口：
+
+```bash
+# 按批次查看每一次解析的规则核验结果与明细字段来源
+curl http://127.0.0.1:8013/api/pipeline/batch/INGE-0004/rule-verification
+
+# 补做：发布命名规则后重新提交原批
+curl -X POST http://127.0.0.1:8013/api/pipeline/batch/recover?batch_no=INGE-0004&parser_rule_name=app-log-v2
+```
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

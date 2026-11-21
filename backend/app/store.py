@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from app.seed import SEED_ROWS
@@ -11,6 +12,9 @@ from app.seed import SEED_ROWS
 
 class Store:
     def __init__(self) -> None:
+        # 内存仓库没有数据库事务，读写关键区用同一把可重入锁串行化。
+        # 解析快照、发布规则和写入明细都依赖这把锁，避免并发时读到半更新状态。
+        self.lock = threading.RLock()
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
